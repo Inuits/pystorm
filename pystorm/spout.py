@@ -4,12 +4,9 @@ Base Spout classes.
 
 from __future__ import absolute_import, print_function, unicode_literals
 
-import itertools
 import logging
 
-from six.moves import zip
-
-from .component import Component
+from .component import AsyncComponent, Component
 
 
 log = logging.getLogger(__name__)
@@ -98,3 +95,11 @@ class Spout(Component):
         else:
             self.logger.error('Received invalid command from Storm: %r', cmd)
         self.send_message({'command': 'sync'})
+
+
+class AsyncSpout(AsyncComponent, Spout):
+    """A Spout that uses separate threads for input, output, and processing.
+
+    This can improve performance in certain situations.
+    """
+    pass
