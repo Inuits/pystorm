@@ -181,11 +181,17 @@ class Component(object):
                               should exit when an exception other than
                               ``StormWentAwayError`` is raised.  Defaults to
                               ``True``.
+    :ivar rdb_signal: Signal to use to trigger remote_pdb handler for debugging
+                      running components.  Defaults to ``SIGUSR1``.
+    :ivar exception_signal: Signal to use to propagate thread exceptions up to
+                            main thread for processing.  Defaults to
+                            ``SIGUSR2``.
     """
     exit_on_exception = True
 
     def __init__(self, input_stream=sys.stdin, output_stream=sys.stdout,
-                 rdb_signal=signal.SIGUSR1, serializer="json"):
+                 rdb_signal=signal.SIGUSR1, serializer="json",
+                 exception_signal=signal.SIGUSR2):
         # Ensure we don't fall back on the platform-dependent encoding and
         # always use UTF-8
         self.topology_name = None
@@ -211,8 +217,16 @@ class Component(object):
             raise ValueError("Unknown serializer: {0}", serializer)
 
         # Setup remote pdb handler if asked to
-        if rdb_signal is not None:
-            signal.signal(rdb_signal, remote_pdb_handler)
+        self.rdb_signal = rdb_signal
+        if self.rdb_signal is not None:
+            signal.signal(self.rdb_signal, remote_pdb_handler)
+
+        # Just in case we have worker threads
+        self.exception_signal = exception_signal
+        if self.exception_signal is not None:
+            signal.signal(self.exception_signal, self._handle_worker_exception)
+        iname = self.__class__.__name__
+        threading.current_thread().name = '{}:main-thread'.format(iname)
 
     @staticmethod
     def is_heartbeat(tup):
@@ -506,6 +520,35 @@ class Component(object):
         """
         self.raise_exception(exc)
 
+    def _create_worker_thread(self, entry_point):
+        """Create a daemon worker thread that will run a function.
+
+        This is a separate function so that all worker threads will raise
+        SIGUSR2 when something goes wrong so that exceptions will be handled by
+
+        """
+        def _thread_wrapper(entry_point):
+            try:
+                while True:
+                    entry_point()
+            except:
+                self.exc_info = sys.exc_info()
+                os.kill(self.pid, signal.SIGUSR2)  # interrupt stdin waiting
+
+        iname = self.__class__.__name__
+        thread = threading.Thread(target=_thread_wrapper(entry_point))
+        thread.name = '{}:{}-thread'.format(iname, entry_point.__name__)
+        thread.daemon = True
+        return thread
+
+    def _handle_worker_exception(self, signum, frame):
+        """Handle an exception raised in the worker thread.
+
+        Exceptions in the _batcher thread will send a SIGUSR2 to the main
+        thread which we catch here, and then raise in the main thread.
+        """
+        reraise(*self.exc_info)
+
 
 class AsyncComponent(Component):
     """A Component that uses separate threads for input, output, and processing.
@@ -519,7 +562,6 @@ class AsyncComponent(Component):
         self._pending_task_ids = Queue(maxsize=1000)
         self._stdout_queue = Queue(maxsize=100)
         self.exc_info = None
-        signal.signal(signal.SIGUSR2, self._handle_worker_exception)
 
     def send_message(self, message):
         """Queue up message to send to on stdout"""
@@ -548,46 +590,20 @@ class AsyncComponent(Component):
         for msg in self._stdout_queue:
             super_self.send_message(msg)
 
-    def _create_worker_thread(self, entry_point):
-        def _thread_wrapper(entry_point):
-            try:
-                while True:
-                    entry_point()
-            except:
-                self.exc_info = sys.exc_info()
-                os.kill(self.pid, signal.SIGUSR2)  # interrupt stdin waiting
-
-        iname = self.__class__.__name__
-        thread = threading.Thread(target=_thread_wrapper(entry_point))
-        thread.name = '{}:_batcher-thread'.format(iname)
-        thread.daemon = True
-        return thread
-
-    def _handle_worker_exception(self, signum, frame):
-        """Handle an exception raised in the worker thread.
-
-        Exceptions in the _batcher thread will send a SIGUSR2 to the main
-        thread which we catch here, and then raise in the main thread.
-        """
-        reraise(*self.exc_info)
-
     def run(self):
-        """Main run loop for all bolts.
+        """Main run loop for AsyncComponents.
 
         Performs initial handshake with Storm and reads tuples handing them off
         to subclasses.  Any exceptions are caught and logged back to Storm
         prior to the Python process exiting.
 
         We override run here (which will always advise against) because we want
-        _run to be called repeatedly in a greenlet instead of in the main
+        _run to be called repeatedly in a thread/greenlet instead of in the main
         thread.
         """
         storm_conf, context = self.read_handshake()
         self._setup_component(storm_conf, context)
         self.initialize(storm_conf, context)
-
-        iname = self.__class__.__name__
-        threading.current_thread().name = '{}:main-thread'.format(iname)
 
         # Start the various greenlets
         reader = self._create_worker_thread(self._reader)
